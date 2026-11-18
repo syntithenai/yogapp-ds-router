@@ -1,0 +1,31 @@
+[Unit]
+Description=Anthropic-compatible proxy for Claude Code → DeepSeek/Moonshot
+Documentation=https://github.com/syntithenai/yogapp-ds-router
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting: Claude Code expects this proxy to always answer.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Foreground mode (no --daemon): systemd owns the process, so there is no
+# double-fork and no pidfile. %h expands to the user's home directory.
+ExecStart=@PYTHON@ %h/.local/bin/yogapp-ds-router
+Environment=PYTHONUNBUFFERED=1
+Environment=YOGAPP_DS_ROUTER_HOST=127.0.0.1
+Environment=YOGAPP_DS_ROUTER_PORT=18787
+# The router also parses this file itself; loading it here keeps
+# YOGAPP_DS_* overrides and any child tooling consistent.
+# "-" = tolerate the file being absent.
+EnvironmentFile=-%h/.config/yogapp/agent.env
+Restart=always
+RestartSec=2
+# Exponential backoff so a hard failure cannot hammer the upstream API.
+RestartSteps=5
+RestartMaxDelaySec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

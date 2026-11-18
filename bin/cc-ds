@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Launch Claude Code through the local proxy (terminal flavour).
+# The VS Code panel does not need this — it reads ~/.claude/settings.json,
+# which `yogapp-agent-config` writes.
+set -euo pipefail
+
+ENV_FILE="${YOGAPP_AGENT_ENV:-$HOME/.config/yogapp/agent.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+ROUTER_URL="${YOGAPP_DS_ROUTER_URL:-http://127.0.0.1:18787}"
+
+healthy() { curl -sf -m 1 "$ROUTER_URL/health" >/dev/null 2>&1; }
+
+# Keep the Claude config in sync when the helper is installed.
+if [[ -x "$HOME/.local/bin/yogapp-agent-config" ]]; then
+  "$HOME/.local/bin/yogapp-agent-config" >/dev/null || true
+fi
+
+if ! healthy; then
+  # Prefer the systemd unit (always-on); fall back to a detached daemon.
+  systemctl --user start yogapp-ds-router.service >/dev/null 2>&1 || true
+  sleep 0.5
+fi
+if ! healthy; then
+  "$HOME/.local/bin/yogapp-ds-router" --daemon >/dev/null 2>&1 || true
+  sleep 0.3
+fi
+if ! healthy; then
+  # Last resort: talk to DeepSeek directly. Images/PDFs will not work.
+  echo "warning: proxy not reachable on $ROUTER_URL — using upstream directly" >&2
+  ROUTER_URL="https://api.deepseek.com/anthropic"
+fi
+
+export ANTHROPIC_BASE_URL="$ROUTER_URL"
+export ANTHROPIC_AUTH_TOKEN="${DEEPSEEK_API_KEY:?Set DEEPSEEK_API_KEY in $ENV_FILE}"
+unset ANTHROPIC_API_KEY || true
+export ANTHROPIC_MODEL='deepseek-flash'
+export ANTHROPIC_DEFAULT_OPUS_MODEL='deepseek-flash'
+export ANTHROPIC_DEFAULT_SONNET_MODEL='deepseek-flash'
+export ANTHROPIC_DEFAULT_HAIKU_MODEL='deepseek-flash'
+export ANTHROPIC_DEFAULT_FABLE_MODEL='kimi-k3.1-pro'
+export CLAUDE_CODE_SUBAGENT_MODEL=deepseek-flash
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=786432
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_EFFORT_LEVEL=medium
+
+cd "${1:-$PWD}"
+exec claude

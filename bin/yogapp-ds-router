@@ -1,0 +1,884 @@
+#!/usr/bin/env python3
+"""Local Anthropic-compat proxy for Claude Code → DeepSeek.
+
+- All DeepSeek traffic (text and images) → deepseek-flash. Pro is never used:
+  it is more expensive and benchmarks no better for our workloads, so there is
+  no drift escalation ladder.
+- PDF / document blocks (unsupported by DeepSeek Anthropic) → extract text
+  and/or render pages to images, then route to vision model
+- model starting with "local/" → LM Studio on :1234 (prefix stripped, no
+  drift/escalation, no cloud key needed)
+
+Usage:
+  yogapp-ds-router              # foreground on :18787
+  yogapp-ds-router --daemon     # background
+  yogapp-ds-router --stop
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+try:
+    import aiohttp
+    from aiohttp import web
+except ImportError:
+    print("aiohttp required: pip install --user aiohttp", file=sys.stderr)
+    raise SystemExit(1)
+
+UPSTREAM = os.environ.get("YOGAPP_DS_UPSTREAM", "https://api.deepseek.com/anthropic")
+HOST = os.environ.get("YOGAPP_DS_ROUTER_HOST", "127.0.0.1")
+PORT = int(os.environ.get("YOGAPP_DS_ROUTER_PORT", "18787"))
+PRIMARY = os.environ.get("YOGAPP_DS_PRIMARY_MODEL", "deepseek-flash")
+VISION = os.environ.get("YOGAPP_DS_VISION_MODEL", "deepseek-flash")
+
+# Flash-only policy: Flash is cheaper and better than Pro for our workloads, so
+# Pro must never be selected. Every DeepSeek request — including explicit
+# deepseek-v4-pro/opus/sonnet requests and any drift escalation — is rewritten
+# to deepseek-flash. Set YOGAPP_DS_ALLOW_PRO=1 only to deliberately restore the
+# old Pro/escalation behaviour.
+ALLOW_PRO = os.environ.get("YOGAPP_DS_ALLOW_PRO", "0") == "1"
+if not ALLOW_PRO:
+    PRIMARY = VISION = "deepseek-flash"
+MAX_PDF_PAGES = int(os.environ.get("YOGAPP_DS_MAX_PDF_PAGES", "20"))
+PID_FILE = Path(os.environ.get("YOGAPP_DS_ROUTER_PID", Path.home() / ".cache/yogapp/ds-router.pid"))
+LOG_FILE = Path(os.environ.get("YOGAPP_DS_ROUTER_LOG", Path.home() / ".cache/yogapp/ds-router.log"))
+# Last routing decision, read by the Claude Code status line (~/.local/bin/cc-route-status).
+STATE_FILE = Path(os.environ.get("YOGAPP_DS_STATE", Path.home() / ".cache/yogapp/route-state.json"))
+
+# Kimi (Moonshot) Anthropic-compatible endpoint. Requests whose model contains
+# "kimi" are routed here with the Moonshot key; everything else stays on DeepSeek.
+MOONSHOT_UPSTREAM = os.environ.get("YOGAPP_MS_UPSTREAM", "https://api.moonshot.ai/anthropic")
+
+# Local LM Studio server (Anthropic-compatible /v1/messages since 0.4.1).
+# Requests whose model starts with LOCAL_PREFIX are forwarded here with the
+# prefix stripped, bypassing the DeepSeek drift/escalation and vision rerouting.
+LOCAL_UPSTREAM = os.environ.get("YOGAPP_LOCAL_UPSTREAM", "http://127.0.0.1:1234")
+LOCAL_PREFIX = "local/"
+
+
+def _agent_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    path = Path(os.environ.get("YOGAPP_AGENT_ENV", Path.home() / ".config/yogapp/agent.env"))
+    try:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            env[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return env
+
+
+_moonshot_cache: dict[str, Any] = {"mtime": 0.0, "key": ""}
+
+
+def moonshot_key() -> str:
+    if os.environ.get("MOONSHOT_API_KEY"):
+        return os.environ["MOONSHOT_API_KEY"]
+    path = Path(os.environ.get("YOGAPP_AGENT_ENV", Path.home() / ".config/yogapp/agent.env"))
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if mtime != _moonshot_cache["mtime"]:
+        _moonshot_cache["mtime"] = mtime
+        _moonshot_cache["key"] = _agent_env().get("MOONSHOT_API_KEY", "")
+    return _moonshot_cache["key"]
+
+
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+}
+
+
+def strip_model_suffix(model: str | None) -> str | None:
+    if not model or not isinstance(model, str):
+        return model
+    # Claude Code often sends deepseek-v4-pro[1m]
+    if "[" in model:
+        return model.split("[", 1)[0]
+    return model
+
+
+# Conversations that drifted on Flash and were bumped to Pro. Keyed by a stable
+# fingerprint so one early signal keeps the rest of the session on the strong
+# model instead of oscillating back to Flash once the trailing tail cleans up.
+#
+# The escalation is bounded: after ESCALATION_TTL Pro requests with no fresh
+# drift signal, the conversation is allowed to fall back to Flash (it re-detects
+# and re-escalates if the drift recurs). This caps how much a single long-lived
+# drift converts to Pro spend.
+_ESCALATED: dict[str, str] = {}
+_ESCALATED_AGE: dict[str, int] = {}
+_ESCALATED_MAX = 500
+ESCALATION_TTL = int(os.environ.get("YOGAPP_DS_ESCALATION_TTL", "40"))
+
+# Cost cap: a client that explicitly asks for deepseek-v4-pro / opus / sonnet is
+# demoted to Flash, so a tab accidentally left on Opus cannot silently burn Pro
+# spend. Under the flash-only policy (ALLOW_PRO=0) no request can reach Pro at
+# all; this flag only matters if Pro was deliberately re-enabled.
+ALLOW_EXPLICIT_PRO = os.environ.get("YOGAPP_DS_ALLOW_EXPLICIT_PRO", "0") == "1"
+
+# Drift escalation is retired along with Pro: Flash is both cheaper and better
+# for our workloads, so a stuck conversation stays on Flash. It can only run
+# when Pro itself is allowed.
+ESCALATION_ENABLED = ALLOW_PRO and os.environ.get("YOGAPP_DS_ESCALATION", "1") == "1"
+
+READ_TOOLS = {"read", "read_file", "notebookread"}
+EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit"}
+
+# Drift signals that renew the escalation sticky counter. "error-loop" is
+# deliberately excluded: an environment error is usually not fixed by a bigger
+# model, so it may trigger escalation once but must not keep re-pinning the
+# conversation to Pro — the TTL still expires and re-probes Flash.
+STRONG_SIGNALS = {"thrash", "loop"}
+
+
+def _block_text(part: Any) -> str:
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        return part.get("text") or ""
+    return ""
+
+
+def conversation_fingerprint(body: dict) -> str:
+    """Stable id for a conversation: first user message + system prompt."""
+    first_user = ""
+    for msg in body.get("messages") or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                first_user = content
+            elif isinstance(content, list):
+                first_user = "".join(_block_text(p) for p in content)
+            break
+    system = body.get("system")
+    if isinstance(system, str):
+        system_text = system
+    elif isinstance(system, list):
+        system_text = "".join(_block_text(p) for p in system)
+    else:
+        system_text = ""
+    if not first_user and not system_text:
+        return ""
+    digest = hashlib.sha1(
+        (system_text + "\x00" + first_user).encode("utf-8", "replace")
+    ).hexdigest()
+    return digest
+
+
+def _tool_signature(part: dict) -> str:
+    try:
+        return str(part.get("name", "")) + ":" + json.dumps(part.get("input"), sort_keys=True)
+    except Exception:
+        return str(part.get("name", ""))
+
+
+def _ordered_tool_blocks(messages: Any):
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("tool_use", "tool_result"):
+                yield part
+
+
+def detect_drift(messages: Any) -> str:
+    """Return a drift signal name, or "" when the tail looks healthy.
+
+    Conservative on purpose: a false positive only costs a little Pro spend,
+    so we favor catching real drift (loops, repeated failures, thrash).
+    """
+    blocks = list(_ordered_tool_blocks(messages))
+    if not blocks:
+        return ""
+
+    # 1) Three or more errors in a row → the model cannot land its fix. A
+    # couple of transient failures is normal (wrong path, transient API error)
+    # and Pro usually can't fix an environment error either — so we only treat
+    # a genuine stuck error-loop as drift, and even then it won't re-pin the
+    # conversation to Pro (see STRONG_SIGNALS).
+    run = 0
+    for b in blocks:
+        if b.get("type") != "tool_result":
+            continue
+        run = run + 1 if b.get("is_error") else 0
+        if run >= 3:
+            return "error-loop"
+
+    # 2) Reading the same file three times without editing → thrashing.
+    # Checked before the generic loop rule so it gets the more specific label.
+    read_path = ""
+    reads = 0
+    for b in blocks:
+        if b.get("type") != "tool_use":
+            continue
+        name = str(b.get("name") or "").lower()
+        inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+        if name in READ_TOOLS:
+            path = str(inp.get("file_path") or inp.get("path") or "")
+            if path and path == read_path:
+                reads += 1
+            else:
+                read_path, reads = path, 1
+            if reads >= 3:
+                return "thrash"
+        elif name in EDIT_TOOLS:
+            read_path, reads = "", 0
+
+    # 3) Same tool + same input three times running → the model is looping.
+    sigs = [_tool_signature(b) for b in blocks if b.get("type") == "tool_use"]
+    run = 1
+    for prev, cur in zip(sigs, sigs[1:]):
+        run = run + 1 if cur == prev else 1
+        if run >= 3:
+            return "loop"
+
+    return ""
+
+
+def remember_escalation(fingerprint: str, signal: str) -> None:
+    if not fingerprint:
+        return
+    _ESCALATED[fingerprint] = signal
+    _ESCALATED_AGE[fingerprint] = 0
+    if len(_ESCALATED) > _ESCALATED_MAX:
+        for stale in list(_ESCALATED)[: len(_ESCALATED) - _ESCALATED_MAX]:
+            _ESCALATED.pop(stale, None)
+            _ESCALATED_AGE.pop(stale, None)
+
+
+def write_state(route: str, model: str, signal: str = "") -> None:
+    """Publish the last routing decision for the Claude Code status line."""
+    payload = {
+        "ts": time.time(),
+        "route": route,
+        "model": model,
+        "escalated": bool(signal),
+        "signal": signal,
+        "transitions": _TRANSITIONS,
+    }
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
+
+
+# Model-switch history, read by the status line so a switch is not missed the
+# instant it happens. Capped ring buffer; in-memory only (lost on router restart).
+_TRANSITIONS: list[dict] = []
+_TRANSITIONS_MAX = 12
+
+
+def _notify(title: str, body: str, urgent: bool = False) -> None:
+    """Best-effort desktop notification on model switch (no-op if disabled)."""
+    if os.environ.get("YOGAPP_DS_NOTIFY", "1") == "0":
+        return
+    try:
+        subprocess.Popen(
+            [
+                "notify-send",
+                "-a",
+                "yogapp-ds-router",
+                "-u",
+                "critical" if urgent else "normal",
+                title,
+                body,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def record_transition(from_model: str, to_model: str, signal: str) -> None:
+    _TRANSITIONS.append(
+        {"ts": time.time(), "from": from_model, "to": to_model, "signal": signal}
+    )
+    del _TRANSITIONS[:-_TRANSITIONS_MAX]
+
+
+def content_has_media(body: dict) -> bool:
+    for msg in body.get("messages") or []:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in (
+                    "image",
+                    "document",
+                    "input_image",
+                ):
+                    return True
+        # system can be list too
+    system = body.get("system")
+    if isinstance(system, list):
+        for part in system:
+            if isinstance(part, dict) and part.get("type") in ("image", "document"):
+                return True
+    return False
+
+
+def extract_pdf_text(data: bytes) -> str:
+    import fitz  # pymupdf
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    parts = []
+    for i, page in enumerate(doc):
+        if i >= MAX_PDF_PAGES:
+            parts.append(f"\n[…truncated after {MAX_PDF_PAGES} pages…]")
+            break
+        parts.append(page.get_text("text"))
+    doc.close()
+    return "\n".join(parts).strip()
+
+
+def pdf_pages_as_images(data: bytes) -> list[dict[str, Any]]:
+    import fitz
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    images: list[dict[str, Any]] = []
+    for i, page in enumerate(doc):
+        if i >= MAX_PDF_PAGES:
+            break
+        # Downscale large pages for API limits
+        mat = fitz.Matrix(1.5, 1.5)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        png = pix.tobytes("png")
+        b64 = base64.standard_b64encode(png).decode("ascii")
+        images.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": b64,
+                },
+            }
+        )
+    doc.close()
+    return images
+
+
+def decode_document_source(source: dict) -> tuple[bytes | None, str]:
+    """Return (bytes, media_type_hint)."""
+    st = source.get("type")
+    if st == "base64":
+        raw = source.get("data") or ""
+        try:
+            return base64.standard_b64decode(raw), source.get("media_type") or "application/pdf"
+        except Exception:
+            return None, "application/pdf"
+    if st == "url":
+        # Lazy: caller may fetch; for now unsupported in sync path
+        return None, "application/pdf"
+    return None, "application/pdf"
+
+
+def rewrite_documents_in_content(content: Any) -> tuple[Any, bool]:
+    """Replace document blocks with text and/or images. Returns (content, used_vision)."""
+    if not isinstance(content, list):
+        return content, False
+    out: list[Any] = []
+    used_vision = False
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "document":
+            out.append(part)
+            continue
+        source = part.get("source") or {}
+        data, media = decode_document_source(source)
+        title = part.get("title") or part.get("filename") or "document.pdf"
+        if not data:
+            out.append(
+                {
+                    "type": "text",
+                    "text": f"[PDF {title}: could not decode attachment; paste text or export pages as images]",
+                }
+            )
+            continue
+        text = ""
+        try:
+            text = extract_pdf_text(data)
+        except Exception as e:
+            text = ""
+            err = str(e)
+        if len(text) >= 80:
+            out.append(
+                {
+                    "type": "text",
+                    "text": f"<pdf_content filename=\"{title}\" source=\"text\">\n{text}\n</pdf_content>",
+                }
+            )
+            # Text-only PDF can stay on primary; no vision flag
+            continue
+        # Scanned / little text → page images for Flash vision
+        try:
+            images = pdf_pages_as_images(data)
+        except Exception as e:
+            out.append(
+                {
+                    "type": "text",
+                    "text": f"[PDF {title}: text extract short ({len(text)} chars) and page render failed: {e}]",
+                }
+            )
+            continue
+        if text:
+            out.append(
+                {
+                    "type": "text",
+                    "text": f"<pdf_content filename=\"{title}\" source=\"partial-text\">\n{text}\n</pdf_content>",
+                }
+            )
+        out.append(
+            {
+                "type": "text",
+                "text": f"[PDF {title}: {len(images)} page image(s) attached for vision model]",
+            }
+        )
+        out.extend(images)
+        used_vision = True
+    return out, used_vision
+
+
+def transform_body(body: dict) -> tuple[dict, str, str]:
+    """Return (new_body, route_label, debug_info)."""
+    body = dict(body)
+    has_images = False
+    pdf_to_images = False
+    pdf_to_text = False
+
+    def had_documents(content: Any) -> bool:
+        return isinstance(content, list) and any(
+            isinstance(p, dict) and p.get("type") == "document" for p in content
+        )
+
+    new_messages = []
+    for msg in body.get("messages") or []:
+        msg = dict(msg)
+        old_content = msg.get("content")
+        if isinstance(old_content, list):
+            for part in old_content:
+                if isinstance(part, dict) and part.get("type") == "image":
+                    has_images = True
+        docs = had_documents(old_content)
+        content, used_vision = rewrite_documents_in_content(old_content)
+        if used_vision:
+            pdf_to_images = True
+            has_images = True
+        elif docs and content != old_content:
+            pdf_to_text = True
+        msg["content"] = content
+        new_messages.append(msg)
+    body["messages"] = new_messages
+
+    system = body.get("system")
+    if isinstance(system, list):
+        for part in system:
+            if isinstance(part, dict) and part.get("type") == "image":
+                has_images = True
+        docs = had_documents(system)
+        new_system, used_vision = rewrite_documents_in_content(system)
+        body["system"] = new_system
+        if used_vision:
+            pdf_to_images = True
+            has_images = True
+        elif docs and new_system != system:
+            pdf_to_text = True
+
+    incoming = strip_model_suffix(body.get("model")) or ""
+    if incoming.startswith(LOCAL_PREFIX):
+        # Local LM Studio model: documents above have already been rewritten to
+        # text/images, which a local VLM accepts. Skip drift/escalation so a
+        # local turn never silently becomes a cloud turn.
+        local_model = incoming[len(LOCAL_PREFIX):]
+        body["model"] = local_model
+        write_state("local", local_model)
+        info = f"req={incoming} fp={conversation_fingerprint(body)[:8]}"
+        return body, f"local:{local_model}", info
+
+    if not ALLOW_PRO:
+        # Flash-only: documents/images were already rewritten above. Pin every
+        # DeepSeek request to Flash and skip drift detection/escalation state.
+        body["model"] = VISION
+        if has_images or pdf_to_images:
+            label = "vision" + ("+pdf-images" if pdf_to_images else "")
+        else:
+            label = "flash"
+            if pdf_to_text:
+                label += "+pdf-text"
+        write_state(label, body["model"])
+        info = f"req={incoming or '-'} fp={conversation_fingerprint(body)[:8]}"
+        return body, label, info
+
+    low = incoming.lower()
+    is_small = any(x in low for x in ("haiku", "flash", "small"))
+
+    # Escalation: once a conversation shows drift, bump it to Pro. The bump is
+    # sticky for ESCALATION_TTL requests, then expires (re-probes Flash) unless a
+    # fresh drift signal renews it — so a single drift does not convert the rest
+    # of a long session to Pro.
+    fingerprint = conversation_fingerprint(body)
+    escalated = _ESCALATED.get(fingerprint, "")
+    drift = detect_drift(body.get("messages") or []) if ESCALATION_ENABLED else ""
+    if drift:
+        if not escalated:
+            print(
+                f"drift detected ({drift}) → escalating conversation to {PRIMARY}",
+                flush=True,
+            )
+            record_transition(VISION, PRIMARY, drift)
+            _notify(
+                f"⬆ Flash → Pro",
+                f"drift: {drift}\nconversation {fingerprint[:8]} escalated",
+                urgent=True,
+            )
+            remember_escalation(fingerprint, drift)
+            escalated = drift
+        elif drift in STRONG_SIGNALS:
+            # Strong signal: renew the sticky counter — the conversation is
+            # still genuinely stuck and Pro is plausibly helping.
+            remember_escalation(fingerprint, drift)
+            escalated = drift
+        else:
+            # Weak signal (error-loop): keep this request escalated but do NOT
+            # reset the TTL, so a conversation that just keeps failing still
+            # expires and re-probes Flash instead of sitting on Pro forever.
+            _ESCALATED_AGE[fingerprint] = _ESCALATED_AGE.get(fingerprint, 0) + 1
+            if _ESCALATED_AGE[fingerprint] >= ESCALATION_TTL:
+                _ESCALATED.pop(fingerprint, None)
+                _ESCALATED_AGE.pop(fingerprint, None)
+                print(
+                    f"escalation expired ({escalated}) after {ESCALATION_TTL} "
+                    "error-loop requests → re-probing Flash",
+                    flush=True,
+                )
+                record_transition(PRIMARY, VISION, "expire")
+                _notify(
+                    "⬇ Pro → Flash",
+                    f"escalation expired after {ESCALATION_TTL} error-loop requests",
+                )
+                escalated = ""
+    elif escalated:
+        _ESCALATED_AGE[fingerprint] = _ESCALATED_AGE.get(fingerprint, 0) + 1
+        if _ESCALATED_AGE[fingerprint] >= ESCALATION_TTL:
+            _ESCALATED.pop(fingerprint, None)
+            _ESCALATED_AGE.pop(fingerprint, None)
+            print(
+                f"escalation expired ({escalated}) after {ESCALATION_TTL} clean "
+                "requests → re-probing Flash",
+                flush=True,
+            )
+            record_transition(PRIMARY, VISION, "expire")
+            _notify(
+                "⬇ Pro → Flash",
+                f"escalation expired after {ESCALATION_TTL} clean requests",
+            )
+            escalated = ""
+
+    # Images (pasted or PDF pages) → Flash vision; Pro cannot see images, so
+    # escalated conversations still take the vision route for media requests.
+    if has_images or pdf_to_images:
+        body["model"] = VISION
+        label = "vision"
+        if pdf_to_images:
+            label += "+pdf-images"
+    elif is_small and escalated:
+        body["model"] = PRIMARY
+        label = f"escalate:{escalated}"
+        if pdf_to_text:
+            label += "+pdf-text"
+    elif is_small:
+        body["model"] = VISION
+        label = "flash"
+    elif ALLOW_EXPLICIT_PRO:
+        body["model"] = PRIMARY
+        label = "primary"
+        if pdf_to_text:
+            label += "+pdf-text"
+    else:
+        # Explicit Pro/Opus/Sonnet request but the cost cap is on: run it on
+        # Flash. Drift escalation above is still the one path to Pro.
+        body["model"] = VISION
+        label = "flash"
+        if pdf_to_text:
+            label += "+pdf-text"
+
+    write_state(label, body["model"], escalated)
+    info = f"req={incoming or '-'} fp={fingerprint[:8]}"
+    return body, label, info
+
+
+async def proxy_request(request: web.Request) -> web.StreamResponse:
+    path = request.path
+    if path == "/" or path == "/health":
+        return web.json_response(
+            {
+                "ok": True,
+                "service": "yogapp-ds-router",
+                "upstream": UPSTREAM,
+                "kimi_upstream": MOONSHOT_UPSTREAM,
+                "kimi_configured": bool(moonshot_key()),
+                "local_upstream": LOCAL_UPSTREAM,
+                "primary": PRIMARY,
+                "vision": VISION,
+                "flash_only": not ALLOW_PRO,
+            }
+        )
+
+    # Only rewrite DeepSeek messages endpoints; Kimi requests are passed through.
+    rewrite = path.rstrip("/").endswith("/messages") or path.endswith("/v1/messages")
+
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP
+    }
+    # Uncompressed hop: avoids zstd (aiohttp) and double-gunzip (Claude fetch ZlibError)
+    headers["Accept-Encoding"] = "identity"
+
+    raw = await request.read()
+    route = "passthrough"
+    body_bytes = raw
+    upstream = UPSTREAM
+    provider = "deepseek"
+    info = ""
+
+    # Detect model to choose provider: "kimi*" → Moonshot, else DeepSeek.
+    peek: Any = None
+    if raw:
+        try:
+            peek = json.loads(raw)
+        except Exception:
+            peek = None
+        if isinstance(peek, dict) and peek.get("model"):
+            model = strip_model_suffix(peek.get("model")) or ""
+            if model.startswith(LOCAL_PREFIX):
+                provider = "local"
+            elif "kimi" in model.lower():
+                provider = "kimi"
+
+    # LM Studio has no token-counting endpoint; estimate locally so Claude Code
+    # gets a sane number instead of a 404 from the local server.
+    if provider == "local" and path.rstrip("/").endswith("/count_tokens"):
+        blob = json.dumps(peek.get("messages") or "") + json.dumps(
+            peek.get("system") or ""
+        ) + json.dumps(peek.get("tools") or "")
+        return web.json_response({"input_tokens": max(1, len(blob) // 4)})
+
+    if provider == "local":
+        upstream = LOCAL_UPSTREAM
+        # LM Studio ignores auth, but pin a token so an unset/expired cloud key
+        # can never break a local session.
+        headers["x-api-key"] = "lm-studio"
+        headers["Authorization"] = "Bearer lm-studio"
+
+    if provider == "kimi":
+        body = dict(peek)
+        body["model"] = strip_model_suffix(body.get("model")) or body.get("model")
+        body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        route = f"kimi:{body['model']}"
+        upstream = MOONSHOT_UPSTREAM
+    elif rewrite and raw:
+        try:
+            body = json.loads(raw)
+            body, route, info = transform_body(body)
+            body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        except Exception as e:
+            route = f"parse-error:{e}"
+            body_bytes = raw
+
+    # Auth: DeepSeek passes through the client token; Kimi swaps in the Moonshot key.
+    if provider == "kimi":
+        key = moonshot_key()
+        if not key:
+            return web.json_response(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "configuration",
+                        "message": "MOONSHOT_API_KEY not set in ~/.config/yogapp/agent.env",
+                    },
+                },
+                status=400,
+            )
+        headers["Authorization"] = f"Bearer {key}"
+        headers["x-api-key"] = key
+    else:
+        auth = headers.get("Authorization") or headers.get("authorization")
+        xkey = headers.get("x-api-key") or headers.get("X-Api-Key")
+        if auth and not xkey:
+            token = auth.split(" ", 1)[-1]
+            headers["x-api-key"] = token
+        if xkey and not auth:
+            headers["Authorization"] = f"Bearer {xkey}"
+
+    url = upstream.rstrip("/") + path
+    if request.query_string:
+        url += "?" + request.query_string
+
+    timeout = aiohttp.ClientTimeout(total=600)
+    # auto_decompress=False: stream bytes as upstream sent them (with identity, plain JSON/SSE)
+    async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
+        async with session.request(
+            request.method,
+            url,
+            data=body_bytes if request.method not in ("GET", "HEAD") else None,
+            headers=headers,
+            compress=False,
+        ) as upstream:
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+            print(f"{ts} {request.method} {path} {info} → {route} status={upstream.status}", flush=True)
+
+            resp = web.StreamResponse(
+                status=upstream.status,
+                reason=upstream.reason,
+            )
+            skip_resp = HOP_BY_HOP | {
+                "content-encoding",
+                "content-length",
+                "content-md5",
+            }
+            for k, v in upstream.headers.items():
+                if k.lower() in skip_resp:
+                    continue
+                resp.headers[k] = v
+            await resp.prepare(request)
+            async for chunk in upstream.content.iter_any():
+                await resp.write(chunk)
+            await resp.write_eof()
+            return resp
+
+
+def create_app() -> web.Application:
+    app = web.Application(client_max_size=100 * 1024 * 1024)
+    app.router.add_route("*", "/{path:.*}", proxy_request)
+    return app
+
+
+async def run_server() -> None:
+    app = create_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+    print(
+        f"yogapp-ds-router listening on http://{HOST}:{PORT} → {UPSTREAM}",
+        flush=True,
+    )
+    policy = "flash-only (Pro disabled)" if not ALLOW_PRO else "pro allowed"
+    print(
+        f"primary={PRIMARY} vision={VISION} policy={policy} local={LOCAL_UPSTREAM}",
+        flush=True,
+    )
+    stop = asyncio.Event()
+
+    def _stop(*_a):
+        stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:
+            pass
+    await stop.wait()
+    await runner.cleanup()
+
+
+def daemonize() -> None:
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if PID_FILE.exists():
+        try:
+            old = int(PID_FILE.read_text().strip())
+            os.kill(old, 0)
+            print(f"already running pid={old}", file=sys.stderr)
+            raise SystemExit(0)
+        except (ProcessLookupError, ValueError, PermissionError):
+            pass
+    pid = os.fork()
+    if pid > 0:
+        PID_FILE.write_text(str(pid))
+        print(f"started pid={pid} log={LOG_FILE}")
+        raise SystemExit(0)
+    os.setsid()
+    pid2 = os.fork()
+    if pid2 > 0:
+        raise SystemExit(0)
+    PID_FILE.write_text(str(os.getpid()))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    with open(LOG_FILE, "a", encoding="utf-8") as log:
+        os.dup2(log.fileno(), 1)
+        os.dup2(log.fileno(), 2)
+    asyncio.run(run_server())
+
+
+def stop_daemon() -> None:
+    if not PID_FILE.exists():
+        print("not running")
+        return
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        print(f"stopped pid={pid}")
+    except Exception as e:
+        print(f"stop failed: {e}")
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def main() -> int:
+    global PORT
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--daemon", action="store_true")
+    ap.add_argument("--stop", action="store_true")
+    ap.add_argument("--port", type=int, default=None)
+    args = ap.parse_args()
+    if args.port is not None:
+        PORT = args.port
+    if args.stop:
+        stop_daemon()
+        return 0
+    if args.daemon:
+        daemonize()
+        return 0
+    asyncio.run(run_server())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

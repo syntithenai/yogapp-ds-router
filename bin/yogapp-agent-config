@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Point Claude Code (CLI *and* the VS Code panel) at the local proxy.
+
+Writes the `env` block in ~/.claude/settings.json so the Claude Code extension
+uses http://127.0.0.1:18787 instead of api.anthropic.com. The VS Code extension
+does not run cc-ds, so this file — not a shell export — is what configures the
+sidebar.
+
+Usage:
+    yogapp-agent-config            # write the config
+    yogapp-agent-config --stdout   # print the Claude settings, write nothing
+    yogapp-agent-config --uninstall
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+ROUTER_DEFAULT = "http://127.0.0.1:18787"
+
+
+def read_agent_env() -> dict[str, str]:
+    """Parse KEY=value lines from the secrets file (no shell involved)."""
+    path = Path(os.environ.get("YOGAPP_AGENT_ENV", Path.home() / ".config/yogapp/agent.env"))
+    env: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            env[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return env
+
+
+def claude_settings() -> dict:
+    agent_env = read_agent_env()
+    key = os.environ.get("DEEPSEEK_API_KEY") or agent_env.get("DEEPSEEK_API_KEY", "")
+    router = os.environ.get("YOGAPP_DS_ROUTER_URL", ROUTER_DEFAULT)
+    return {
+        "env": {
+            # Local proxy: every tier is deepseek-flash (the router rewrites the
+            # rest). Kimi models are forwarded to Moonshot by the router.
+            "ANTHROPIC_BASE_URL": router,
+            "ANTHROPIC_AUTH_TOKEN": key,
+            "ANTHROPIC_MODEL": "deepseek-flash",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-flash",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-flash",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-flash",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": "kimi-k3.1-pro",
+            "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-flash",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "CLAUDE_CODE_EFFORT_LEVEL": "medium",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432",
+            # Anthropic's free server-side Auto classifier needs an Anthropic
+            # upstream. Opt out so Claude Code stops nagging about the gateway.
+            "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
+        },
+        "modelSettings": {
+            "deepseek-flash": {"effortLevel": "medium"},
+            # Kimi reasons best at max; the global "medium" would downgrade it.
+            "kimi-k3.1-pro": {"effortLevel": "max"},
+        },
+    }
+
+
+def load_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_json(path: Path, data: dict, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    if mode is not None:
+        path.chmod(mode)
+
+
+def apply() -> int:
+    home = Path.home()
+    settings = claude_settings()
+    target = home / ".claude" / "settings.json"
+
+    # Merge rather than clobber: keep hooks/permissions the user already has.
+    existing = load_json(target)
+    merged_env = {**existing.get("env", {}), **settings["env"]}
+    merged_models = {**existing.get("modelSettings", {}), **settings["modelSettings"]}
+    existing["env"] = merged_env
+    existing["modelSettings"] = merged_models
+    write_json(target, existing, mode=0o600)
+
+    vs = home / ".config" / "Code" / "User" / "settings.json"
+    vs_data = load_json(vs)
+    vs_data["claudeCode.disableLoginPrompt"] = True
+    vs_data["claudeCode.preferredLocation"] = "panel"
+    write_json(vs, vs_data)
+
+    if not merged_env.get("ANTHROPIC_AUTH_TOKEN"):
+        print(
+            "warning: no DEEPSEEK_API_KEY found — set it in "
+            f"{os.environ.get('YOGAPP_AGENT_ENV', '~/.config/yogapp/agent.env')}",
+            file=sys.stderr,
+        )
+    print(f"wrote {target}")
+    print(f"wrote {vs}")
+    print(f"Claude Code → {merged_env['ANTHROPIC_BASE_URL']}")
+    return 0
+
+
+def uninstall() -> int:
+    target = Path.home() / ".claude" / "settings.json"
+    existing = load_json(target)
+    env = existing.get("env", {})
+    for key in [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_CODE_AUTO_MODE_SERVER",
+    ]:
+        env.pop(key, None)
+    existing["env"] = env
+    write_json(target, existing, mode=0o600)
+    print(f"removed proxy settings from {target}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--stdout", action="store_true", help="print settings, write nothing")
+    ap.add_argument("--uninstall", action="store_true", help="remove proxy settings")
+    args = ap.parse_args()
+    if args.stdout:
+        print(json.dumps(claude_settings(), indent=2))
+        return 0
+    if args.uninstall:
+        return uninstall()
+    return apply()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
